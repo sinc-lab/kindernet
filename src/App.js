@@ -10,7 +10,7 @@ import FolderOpenIcon from '@mui/icons-material/FolderOpen';
 import CategoryList from "./CategoryList"
 import ImagesList from "./ImagesList"
 import { Network } from './NeuralNetwork';
-import {height, unit_sep, use_timer, base_timer} from './constants';
+import {height, unit_sep, use_timer, base_timer, batch_size, train_epochs, train_debounce, use_shape_uniforms, feature_chunk, data_tensors, bn_momentum, capture_cooldown} from './constants';
 import Avatar from '@mui/material/Avatar';
 import logo from "./ia.png"
 import sinclogo from "./sinc-logo.png"
@@ -20,6 +20,14 @@ import * as mobilenet from '@tensorflow-models/mobilenet';
 
 var TEST_SAMPLES = 2
 var MIN_SAMPLES = 5
+
+// elegido por el usuario o, por defecto, activado en máquinas modestas
+function defaultLowPerfMode(){
+    const saved = localStorage.getItem('kindernet_low_perf')
+    if(saved !== null)
+        return saved === 'true'
+    return Boolean((navigator.deviceMemory && navigator.deviceMemory <= 4) || (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 2))
+}
 
 // event listener
 class EventListener extends React.Component{
@@ -41,7 +49,7 @@ class KinderNet extends React.Component{
         this.state={
             img_size: 64,
             is_training: false,
-            is_adding_pic: false,
+            low_perf: defaultLowPerfMode(),
             category: -1,
             classifying: false,
             net_size: 0, // mayor valor, mas compleja la red
@@ -60,9 +68,19 @@ class KinderNet extends React.Component{
             save_state: false,
             load_state: false,
             saved_states: [],
-            save_name: ""
+            save_name: "",
+            gpu_error: false
         };
         this.response = null
+        // estado del entrenamiento (fuera de this.state: setState es asíncrono)
+        this.training = false
+        this.train_pending = false
+        this.train_timer = null
+        this.classify_timer = null
+        this.output_timer = null
+        this.last_pic = 0
+        this.gpu_recovery_tried = false
+        this.pending_dispose = []
         this.captureGlobalEvent = this.captureGlobalEvent.bind(this);
         this.handleTransitionEnd = this.handleTransitionEnd.bind(this);
         this.handleTimerOut = this.handleTimerOut.bind(this);
@@ -77,6 +95,8 @@ class KinderNet extends React.Component{
         this.handleSaveState = this.handleSaveState.bind(this);
         this.handleLoadState = this.handleLoadState.bind(this);
         this.handleDeleteSavedState = this.handleDeleteSavedState.bind(this);
+        this.handleLowPerfChange = this.handleLowPerfChange.bind(this);
+        this.handleTrainNow = this.handleTrainNow.bind(this);
         
         this.classifyPic = this.classifyPic.bind(this);
     }
@@ -89,11 +109,13 @@ class KinderNet extends React.Component{
         
         let classifier = tf.sequential();
         if(net_size === 0){
-            classifier.add(tf.layers.conv2d({filters: 16, kernelSize: 3, activation: 'relu', inputShape: [this.state.img_size, this.state.img_size, 3]}))
-            classifier.add(tf.layers.batchNormalization())
+            // los píxeles entran en 0-255 y la red los lleva a 0-1
+            classifier.add(tf.layers.rescaling({scale: 1/255, inputShape: [this.state.img_size, this.state.img_size, 3]}))
+            classifier.add(tf.layers.conv2d({filters: 16, kernelSize: 3, activation: 'relu'}))
+            classifier.add(tf.layers.batchNormalization({momentum: bn_momentum}))
             classifier.add(tf.layers.maxPooling2d({poolSize: 2}))
             classifier.add(tf.layers.conv2d({filters: 32, kernelSize: 5, activation: 'relu'}))
-            classifier.add(tf.layers.batchNormalization())
+            classifier.add(tf.layers.batchNormalization({momentum: bn_momentum}))
             classifier.add(tf.layers.maxPooling2d({poolSize: 2}))
             classifier.add(tf.layers.flatten())
             classifier.add(tf.layers.dense({units: nclasses, activation: 'softmax'}))
@@ -107,29 +129,156 @@ class KinderNet extends React.Component{
         return classifier
     }
 
+    replaceClassifier(net_size, nclasses){
+        if(window.classifier){
+            window.classifier.stopTraining = true
+            this.disposeLater(window.classifier)
+        }
+        window.classifier = this.defineNet(net_size, nclasses)
+    }
+
+    // La GPU puede dejar de devolver resultados sin avisar (ni error ni contexto perdido): todo se lee como cero.
+    // Esta sonda lo detecta; sin ella la app muestra 0% como si la red no hubiera aprendido nada.
+    gpuIsHealthy(){
+        let healthy = false
+        try{
+            healthy = tf.tidy(() => tf.tensor1d([1, 2, 3]).square().sum().arraySync() === 14)
+        }catch(error){
+            console.error("Error al comprobar la GPU:", error)
+        }
+        if(!healthy)
+            console.error("Diagnóstico de la GPU:", JSON.stringify(this.gpuDiagnostics()))
+        return healthy
+    }
+
+    gpuDiagnostics(){
+        const flags = ['WEBGL_VERSION', 'WEBGL_RENDER_FLOAT32_ENABLED', 'WEBGL_DOWNLOAD_FLOAT_ENABLED',
+            'WEBGL_FORCE_F16_TEXTURES', 'WEBGL_BUFFER_SUPPORTED', 'WEBGL_FENCE_API_ENABLED', 'WEBGL_PACK']
+        const info = {backend: tf.getBackend(), memoria: tf.memory().numTensors}
+        flags.forEach(f => { try{ info[f] = tf.env().get(f) }catch(error){ info[f] = 'error' } })
+        try{
+            const gl = tf.backend().gpgpu.gl
+            info.contextLost = gl.isContextLost()
+            info.glError = gl.getError()
+            const ext = gl.getExtension('WEBGL_debug_renderer_info')
+            info.renderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'desconocido'
+        }catch(error){
+            info.gl = 'sin acceso al contexto'
+        }
+        return info
+    }
+
+    // Recrea el backend y rearma los datos desde las fotos guardadas. Devuelve false si no se pudo recuperar.
+    async recoverFromGpuFailure(){
+        console.warn("La GPU dejó de devolver resultados: recreando el backend")
+        this.cancelScheduledTraining()
+        this.pending_dispose = []
+        try{
+            const factory = tf.findBackendFactory('webgl')
+            tf.removeBackend('webgl')
+            if(factory)
+                tf.registerBackend('webgl', factory, 2)
+            await tf.setBackend(factory ? 'webgl' : 'cpu')
+            await tf.ready()
+        }catch(error){
+            console.error("No se pudo recrear el backend:", error)
+            return false
+        }
+        if(!this.gpuIsHealthy())
+            return false
+        window.classifier = this.defineNet(this.state.net_size, this.state.category_names.length)
+        await this.rebuildFromImages()
+        return this.gpuIsHealthy()
+    }
+
+    // Rearma los tensores desde los PNG del estado. Los anteriores ya murieron con el backend, no se liberan.
+    async rebuildFromImages(){
+        const size = this.state.img_size
+        const nclasses = this.state.category_names.length
+        const frames = {train: [], test: []}
+        for(let cat = 0; cat < this.state.images.length; cat++)
+            for(let i = 0; i < this.state.images[cat].length; i++)
+                frames[i < TEST_SAMPLES ? 'test' : 'train'].push({data: await this.decodeImage(this.state.images[cat][i], size), cat})
+
+        for(const set of ['train', 'test']){
+            window[set + '_features'] = tf.zeros([0, 1024])
+            if(frames[set].length === 0){
+                window[set + '_tensors'] = tf.zeros([0, size, size, 3])
+                window[set + '_labels'] = tf.zeros([0, nclasses])
+                continue
+            }
+            const [tensors, labels] = tf.tidy(() => [
+                tf.stack(frames[set].map(f => tf.browser.fromPixels(f.data).toFloat())),
+                tf.oneHot(frames[set].map(f => f.cat), nclasses).toFloat()
+            ])
+            window[set + '_tensors'] = tensors
+            window[set + '_labels'] = labels
+        }
+    }
+
+    decodeImage(dataUrl, size){
+        return new Promise((resolve, reject) => {
+            const image = new Image()
+            image.onload = () => {
+                const canvas = document.createElement('canvas')
+                canvas.width = size
+                canvas.height = size
+                const context = canvas.getContext('2d')
+                context.drawImage(image, 0, 0, size, size)
+                resolve(context.getImageData(0, 0, size, size))
+            }
+            image.onerror = reject
+            image.src = dataUrl
+        })
+    }
+
+    // libera un tensor o modelo; si hay un fit() en curso, lo difiere hasta que termine
+    disposeLater(x){
+        if(!x) return
+        if(this.training)
+            this.pending_dispose.push(x)
+        else
+            x.dispose()
+    }
+
+    flushDisposals(){
+        this.pending_dispose.forEach(x => x.dispose())
+        this.pending_dispose = []
+    }
+
     resetValues(){
+        this.cancelScheduledTraining()
+        data_tensors.forEach(name => this.disposeLater(window[name]))
         window.train_tensors = tf.zeros([0, this.state.img_size, this.state.img_size, 3])
         window.train_features = tf.zeros([0, 1024])
         window.train_labels = tf.zeros([0, 2])
         window.test_tensors = tf.zeros([0, this.state.img_size, this.state.img_size, 3])
         window.test_features = tf.zeros([0, 1024])
         window.test_labels = tf.zeros([0, 2])
-        // Inicializa el timer
-        if(use_timer)
-            setTimeout(this.handleTimerOut, base_timer)
-        window.classifier = this.defineNet(0, 2)
+        // Inicializa el timer (uno solo)
+        if(use_timer){
+            clearTimeout(this.classify_timer)
+            this.classify_timer = setTimeout(this.handleTimerOut, base_timer)
+        }
+        this.replaceClassifier(0, 2)
         this.setState({net_size: 0, category: -1, output_on: -1, classifying: false, accuracy: [0, 0],
         images: [[], []], n_samples: [0,0], n_outputs: [0, 0], category_names: ["Cosa 1", "Cosa 2"]})
-        
     }
 
     componentDidMount() {
-        // create async function to load model
-        async function loadModel() {
-            return await mobilenet.load();
+        // las formas van como uniforms en los shaders: menos programas WebGL para compilar
+        if(use_shape_uniforms){
+            try{
+                tf.env().set('WEBGL_USE_SHAPES_UNIFORMS', true)
+            }catch(error){
+                console.warn("No se pudo activar WEBGL_USE_SHAPES_UNIFORMS:", error)
+            }
         }
-        // load model
-        loadModel().then((mobilenet) => {window.mobilenet=mobilenet; this.setState({listen_keys: true})});
+
+        mobilenet.load().then((net) => {
+            window.mobilenet = net
+            this.setState({listen_keys: true, gpu_error: !this.gpuIsHealthy()})
+        })
 
         this.resetValues()
         this.loadSavedStatesList()
@@ -149,6 +298,7 @@ class KinderNet extends React.Component{
             const modelKey = `kindernet_model_${Date.now()}`
             await window.classifier.save(`indexeddb://${modelKey}`)
             
+            this.ensureFeatures()
             // Convert tensors to arrays for serialization
             const trainTensorsData = window.train_tensors ? await window.train_tensors.array() : null
             const trainFeaturesData = window.train_features ? await window.train_features.array() : null
@@ -216,14 +366,13 @@ class KinderNet extends React.Component{
                 load_state: false 
             })
 
-            // Dispose old tensors to free memory
-            if (window.train_tensors) window.train_tensors.dispose()
-            if (window.train_features) window.train_features.dispose()
-            if (window.train_labels) window.train_labels.dispose()
-            if (window.test_tensors) window.test_tensors.dispose()
-            if (window.test_features) window.test_features.dispose()
-            if (window.test_labels) window.test_labels.dispose()
-            if (window.classifier) window.classifier.dispose()
+            // Liberar tensores y modelo anteriores
+            this.cancelScheduledTraining()
+            data_tensors.forEach(name => this.disposeLater(window[name]))
+            if (window.classifier) {
+                window.classifier.stopTraining = true
+                this.disposeLater(window.classifier)
+            }
 
             // Load model from IndexedDB
             const modelKey = stateData.modelKey || stateKey
@@ -348,10 +497,9 @@ class KinderNet extends React.Component{
     }
 
     handleClassifierChange(net_size){
-        window.classifier = this.defineNet(net_size, this.state.category_names.length)
+        this.replaceClassifier(net_size, this.state.category_names.length)
         this.setState({net_size: net_size, category: -1, output_on: -1, classifying: false, accuracy: Array(this.state.category_names.length).fill(0)})
-        
-        return
+        this.scheduleTraining()
     }
     handleAddCategory(){
         let category_names = this.state.category_names
@@ -362,18 +510,16 @@ class KinderNet extends React.Component{
         let images = this.state.images
         images.push([])
         
-        // add column to labels tensor 
-        if(window.train_labels){
-            let new_column = tf.zeros([window.train_labels.shape[0], 1])
-            window.train_labels = tf.concat([window.train_labels, new_column], 1)
+        // agrega una columna a las etiquetas
+        for(const name of ['train_labels', 'test_labels']){
+            const old = window[name]
+            if(!old) continue
+            window[name] = tf.tidy(() => tf.concat([old, tf.zeros([old.shape[0], 1])], 1))
+            this.disposeLater(old)
         }
 
-        if(window.test_labels){
-            let new_column = tf.zeros([window.test_labels.shape[0], 1])
-            window.test_labels = tf.concat([window.test_labels, new_column], 1)
-        }
-
-        window.classifier = this.defineNet(this.state.net_size, category_names.length)
+        this.cancelScheduledTraining()
+        this.replaceClassifier(this.state.net_size, category_names.length)
         this.setState({category_names, n_samples, category: -1, output_on: -1, 
             classifying: false, accuracy: zeros, images})
         return
@@ -387,366 +533,288 @@ class KinderNet extends React.Component{
 
         n_samples.splice(category, 1)
         
-        // remove files and columns of category
-        if(window.train_labels){
-            let ind = []
-            let labels_data = window.train_labels.arraySync()
-            for(let i = 0; i < window.train_labels.shape[0]; i++)
-                if(labels_data[i][category] === 0)
-                ind.push(i)
-            ind = tf.tensor1d(ind, 'int32');
+        // saca las fotos y la columna de la categoría
+        this.removeCategoryFromSet('train', category)
+        this.removeCategoryFromSet('test', category)
 
-            window.train_labels = window.train_labels.gather(ind)
-            window.train_features = window.train_features.gather(ind)
-            window.train_tensors = window.train_tensors.gather(ind)
-
-            ind = tf.tensor1d(Array.from(Array(window.train_labels.shape[1]).keys()).filter(x => x !== category), 'int32')
-            window.train_labels = window.train_labels.gather(ind, 1)
-        }              
-        
-        if(window.test_labels){
-            let ind = []
-            let labels_data = window.test_labels.arraySync()
-            for(let i = 0; i < window.test_labels.shape[0]; i++)
-                if(labels_data[i][category] === 0)
-                ind.push(i)
-            ind = tf.tensor1d(ind, 'int32');
-
-            window.test_labels = window.test_labels.gather(ind)
-            window.test_features = window.test_features.gather(ind)
-            window.test_tensors = window.test_tensors.gather(ind)
-
-            ind = tf.tensor1d(Array.from(Array(window.test_labels.shape[1]).keys()).filter(x => x !== category), 'int32')
-            window.test_labels = window.test_labels.gather(ind, 1)
-        }
-
-        window.classifier = this.defineNet(this.state.net_size, n_samples.length)
-        this.setState({n_samples, images, category_names, category: -1, 
+        this.replaceClassifier(this.state.net_size, n_samples.length)
+        this.setState({n_samples, images, category_names, category: -1,
             output_on: -1, classifying: false, accuracy: Array(this.state.category_names.length).fill(0)})
-
-        return
+        this.scheduleTraining()
     }
-    
+
+    removeCategoryFromSet(set, category){
+        const labels = window[set + '_labels'].arraySync()
+        const rows = []
+        for(let i = 0; i < labels.length; i++)
+            if(labels[i][category] === 0) rows.push(i)
+        this.keepRowsInSet(set, rows, category)
+    }
+
+    // deja solo las filas `rows` del conjunto; con `drop_column` saca esa columna de las etiquetas
+    keepRowsInSet(set, rows, drop_column = -1){
+        const old = [window[set + '_tensors'], window[set + '_features'], window[set + '_labels']]
+        const gather = (x, r) => r.length > 0 ? x.gather(tf.tensor1d(r, 'int32')) : tf.zeros([0, ...x.shape.slice(1)])
+        const [tensors, features, labels] = tf.tidy(() => {
+            let labels = gather(old[2], rows)
+            if(drop_column !== -1){
+                const cols = Array.from(Array(old[2].shape[1]).keys()).filter(c => c !== drop_column)
+                labels = rows.length > 0 ? labels.gather(tf.tensor1d(cols, 'int32'), 1) : tf.zeros([0, cols.length])
+            }
+            // los rasgos pueden faltar para las últimas filas
+            return [gather(old[0], rows), gather(old[1], rows.filter(i => i < old[1].shape[0])), labels]
+        })
+        old.forEach(t => this.disposeLater(t))
+        window[set + '_tensors'] = tensors
+        window[set + '_features'] = features
+        window[set + '_labels'] = labels
+    }
+
     handleDeleteImage(category, imageIndex){
-        // No permitir eliminar si no hay imágenes
-        if(this.state.n_samples[category] === 0 || imageIndex >= this.state.n_samples[category]){
+        if(this.state.n_samples[category] === 0 || imageIndex >= this.state.n_samples[category])
             return
-        }
 
         let images = this.state.images
         let n_samples = this.state.n_samples
-        
-        // Determinar si la imagen está en test o train
-        const isTestImage = imageIndex < TEST_SAMPLES
-        
-        // Eliminar la imagen del array
+
+        // por categoría, primero van las fotos de prueba y después las de entrenamiento
+        const test_labels = window.test_labels.arraySync()
+        const n_test = test_labels.filter(label => label[category] === 1).length
+        const set = imageIndex < n_test ? 'test' : 'train'
+        const position = imageIndex < n_test ? imageIndex : imageIndex - n_test
+        const labels = set === 'test' ? test_labels : window.train_labels.arraySync()
+        let row = -1, count = 0
+        for(let i = 0; i < labels.length && row === -1; i++){
+            if(labels[i][category] !== 1) continue
+            if(count === position) row = i
+            count++
+        }
+        if(row !== -1)
+            this.keepRowsInSet(set, Array.from(Array(labels.length).keys()).filter(i => i !== row))
+
         images[category].splice(imageIndex, 1)
         n_samples[category] -= 1
-
-        // Calcular el índice en los tensores correspondientes
-        // Primero contar cuántas imágenes de test/train hay en categorías anteriores
-        let testTensorIndex = 0
-        let trainTensorIndex = 0
-        
-        for(let cat = 0; cat < category; cat++){
-            const catSamples = this.state.n_samples[cat]
-            for(let i = 0; i < catSamples; i++){
-                if(i < TEST_SAMPLES){
-                    testTensorIndex++
-                } else {
-                    trainTensorIndex++
-                }
-            }
-        }
-        
-        // Agregar el offset dentro de la categoría actual
-        if(isTestImage){
-            testTensorIndex += imageIndex
-        } else {
-            trainTensorIndex += (imageIndex - TEST_SAMPLES)
-        }
-        
-        // Eliminar de los tensores correspondientes usando gather
-        // No usar tf.tidy() aquí porque estamos asignando a variables globales
-        if(isTestImage && window.test_tensors && window.test_tensors.shape[0] > testTensorIndex && testTensorIndex >= 0){
-            const totalTest = window.test_tensors.shape[0]
-            const indices = Array.from(Array(totalTest).keys())
-                .filter(i => i !== testTensorIndex)
-            
-            if(indices.length > 0){
-                const indicesTensor = tf.tensor1d(indices, 'int32')
-                // Crear nuevos tensores primero
-                const oldTestTensors = window.test_tensors
-                const oldTestFeatures = window.test_features
-                const oldTestLabels = window.test_labels
-                
-                window.test_tensors = oldTestTensors.gather(indicesTensor)
-                window.test_features = oldTestFeatures.gather(indicesTensor)
-                window.test_labels = oldTestLabels.gather(indicesTensor)
-                
-                // Dispose de los tensores antiguos
-                oldTestTensors.dispose()
-                oldTestFeatures.dispose()
-                oldTestLabels.dispose()
-                indicesTensor.dispose()
-            } else {
-                // Si no quedan elementos, crear tensores vacíos
-                if(window.test_tensors) window.test_tensors.dispose()
-                if(window.test_features) window.test_features.dispose()
-                if(window.test_labels) window.test_labels.dispose()
-                
-                window.test_tensors = tf.zeros([0, this.state.img_size, this.state.img_size, 3])
-                window.test_features = tf.zeros([0, 1024])
-                window.test_labels = tf.zeros([0, this.state.category_names.length])
-            }
-        }
-        
-        if(!isTestImage && window.train_tensors && window.train_tensors.shape[0] > trainTensorIndex && trainTensorIndex >= 0){
-            const totalTrain = window.train_tensors.shape[0]
-            const indices = Array.from(Array(totalTrain).keys())
-                .filter(i => i !== trainTensorIndex)
-            
-            if(indices.length > 0){
-                const indicesTensor = tf.tensor1d(indices, 'int32')
-                // Crear nuevos tensores primero
-                const oldTrainTensors = window.train_tensors
-                const oldTrainFeatures = window.train_features
-                const oldTrainLabels = window.train_labels
-                
-                window.train_tensors = oldTrainTensors.gather(indicesTensor)
-                window.train_features = oldTrainFeatures.gather(indicesTensor)
-                window.train_labels = oldTrainLabels.gather(indicesTensor)
-                
-                // Dispose de los tensores antiguos
-                oldTrainTensors.dispose()
-                oldTrainFeatures.dispose()
-                oldTrainLabels.dispose()
-                indicesTensor.dispose()
-            } else {
-                if(window.train_tensors) window.train_tensors.dispose()
-                if(window.train_features) window.train_features.dispose()
-                if(window.train_labels) window.train_labels.dispose()
-                
-                window.train_tensors = tf.zeros([0, this.state.img_size, this.state.img_size, 3])
-                window.train_features = tf.zeros([0, 1024])
-                window.train_labels = tf.zeros([0, this.state.category_names.length])
-            }
-        }
-        
-        // Resetear accuracy ya que el modelo necesita reentrenarse
-        this.setState({
-            images: images,
-            n_samples: n_samples,
-            accuracy: Array(this.state.category_names.length).fill(0),
-            is_training: false
-        })
-        
-        // Si hay suficientes muestras, reentrenar automáticamente
-        this.trainClassifier()
+        this.setState({images, n_samples, accuracy: Array(this.state.category_names.length).fill(0)})
+        this.scheduleTraining()
     }
-    
+
     handleTimerOut(){
-
-        if(!this.state.classifying){
-            setTimeout(this.handleTimerOut, base_timer)
-            return
-        }
-        
-        this.classifyPic()
-
-        setTimeout(this.handleTimerOut, base_timer)
-        return
+        if(this.state.classifying)
+            this.classifyPic()
+        this.classify_timer = setTimeout(this.handleTimerOut, base_timer)
     }
     handleTransitionEnd(){
+        clearTimeout(this.output_timer)
         this.setState({output_on: -1})
     }
     handleTrain(category){
         this.addPic(category)
-        this.trainClassifier()
     }
     handleKeyListen(is_enabled){
         this.setState({listen_keys: is_enabled})
     }
 
-
     argmax(array){ return array.map((x, i) => [x, i]).reduce((r, a) => (a[0] > r[0] ? a : r))[1]}
 
+    // cuadro actual de la cámara (espejado) en un canvas de img_size x img_size, o null si todavía no hay video
+    captureFrame(){
+        const video = window.webcam ? window.webcam.video : null
+        if(!video || video.readyState < 2)
+            return null
+        const size = this.state.img_size
+        const canvas = document.createElement('canvas')
+        canvas.width = size
+        canvas.height = size
+        const context = canvas.getContext('2d')
+        context.translate(size, 0)
+        context.scale(-1, 1)
+        context.drawImage(video, 0, 0, size, size)
+        return {canvas, imageData: context.getImageData(0, 0, size, size)}
+    }
+
     classifyPic(){
-        const base64ImageData =  window.webcam.getScreenshot()
+        const frame = this.captureFrame()
+        if(!frame || !window.classifier || !window.mobilenet)
+            return
 
-        // Create a new Image object
-        const image = new Image();
+        const scores = tf.tidy(() => {
+            const pixels = tf.browser.fromPixels(frame.imageData).expandDims(0)
+            const input = this.state.net_size === 2 ? window.mobilenet.infer(pixels, true) : pixels.toFloat()
+            return window.classifier.predict(input).arraySync()[0]
+        })
 
-        // Set the source of the image as the Base64 image data
-        image.src = base64ImageData;
+        const argmax = this.argmax(scores)
+        this.setState({scores: scores, category: argmax, output_on: argmax})
+    }
 
-        // Wait for the image to load
-        image.onload = () => {
-            const canvas = document.createElement('canvas');
-            canvas.width = this.state.img_size;
-            canvas.height = this.state.img_size;
-            const context = canvas.getContext('2d');
-            context.translate(this.state.img_size, 0);
-            context.scale(-1, 1);
-            context.drawImage(image, 0, 0, canvas.width, canvas.height);
-            const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-            
-            var output = null
-            var scores = null
-            tf.tidy(() => {
-                var tensor = tf.browser.fromPixels(imageData).expandDims(0);
-                
-                if(this.state.net_size === 2){ 
-                    // MobileNet preprocessing
-                    output = window.classifier.predict(window.mobilenet.infer(tensor, true))
-                }
-                else{
-                    output = window.classifier.predict(tensor)
-                }
-                scores = output.arraySync()[0]
-            }
-            )
-            
-            const argmax = this.argmax(scores)
-            this.setState({scores: scores, category: argmax, output_on: argmax})   
-        };        
-        
-       
+    // El entrenamiento se dispara train_debounce ms después de la última foto, una vez por ráfaga
+
+    scheduleTraining(){
+        clearTimeout(this.train_timer)
+        if(this.state.low_perf)
+            return
+        this.train_timer = setTimeout(() => this.trainClassifier(), train_debounce)
+    }
+
+    cancelScheduledTraining(){
+        clearTimeout(this.train_timer)
+        this.train_timer = null
+        this.train_pending = false
+    }
+
+    enoughSamples(){
+        return this.state.n_samples.length > 0 && this.state.n_samples.every(n => n >= MIN_SAMPLES)
+    }
+
+    // completa hasta un múltiplo de batch_size repitiendo ejemplos: lotes de forma fija, sin recompilar shaders
+    padToBatch(x, y){
+        const n = x.shape[0]
+        const padded = Math.ceil(n / batch_size) * batch_size
+        const ind = Array.from(Array(n).keys())
+        for(let i = n; i < padded; i++)
+            ind.push(Math.floor(Math.random() * n))
+        return tf.tidy(() => {
+            const idx = tf.tensor1d(ind, 'int32')
+            return [x.gather(idx), y.gather(idx)]
+        })
+    }
+
+    async trainClassifier(){
+        if(!this.enoughSamples())
+            return
+        if(this.training){
+            this.train_pending = true
+            return
         }
 
-    trainClassifier(){
-        // count number of samples per category in train_labels
+        this.training = true
+        this.train_pending = false
+        this.setState({is_training: true})
 
-        let enoughSamples = true
-        for(let i = 0; i < this.state.n_samples.length; i++)
-            if(this.state.n_samples[i]<MIN_SAMPLES) enoughSamples = false 
-    
-        // Fit the model only if there are at least N samples per category, the model is not training
-        if(enoughSamples && !this.state.is_training){
+        const model = window.classifier
+        const net_size = this.state.net_size
+        if(net_size === 2)
+            this.ensureFeatures()
+        const train_input = net_size < 2 ? window.train_tensors : window.train_features
+        const [train_x, train_y] = this.padToBatch(train_input, window.train_labels)
 
-            this.setState({is_training: true})
-            
-            
-            tf.tidy(() => {
-
-                let train_input, test_input
-                if(this.state.net_size<2){
-                    train_input = window.train_tensors
-                    test_input = window.test_tensors
-                }
+        try{
+            await model.fit(train_x, train_y, {batchSize: batch_size, epochs: train_epochs, shuffle: true})
+            // si la red cambió durante el fit, el resultado ya no sirve
+            if(model === window.classifier){
+                if(this.gpuIsHealthy())
+                    this.setState({accuracy: this.evaluate(model, net_size), gpu_error: false})
                 else{
-                    train_input = window.train_features
-                    test_input = window.test_features
+                    // se intenta recuperar una sola vez: si vuelve a fallar, no tiene sentido insistir
+                    const recovered = !this.gpu_recovery_tried && await this.recoverFromGpuFailure()
+                    this.gpu_recovery_tried = true
+                    this.setState({gpu_error: !recovered})
+                    this.train_pending = recovered
                 }
-                
-                window.classifier.fit(train_input, window.train_labels, {
-                    batchSize: 8,
-                    epochs: 10,
-                    shuffle: true,
-                    //validationData: [test_input, window.test_labels],
-                    //callbacks: {
-                    //    onEpochEnd: (epoch, logs) => {
-                    //    console.log(`Epoch ${epoch + 1} loss: ${logs.loss.toFixed(2)} acc: ${logs.acc.toFixed(2)} val_loss: ${logs.val_loss.toFixed(2)} val_acc: ${logs.val_acc.toFixed(2)}`);
-                    //    //console.log(`Epoch ${epoch + 1} loss: ${logs.loss.toFixed(2)} acc: ${logs.acc.toFixed(2)}`);
-                    //}
-                    //},
-                    //yieldEvery: 'never',
-                }).then(() => {
-
-                    // convert one-hot encoding to integer labels
-                    let test_labels_int = []
-                    for(let i = 0; i < window.test_labels.shape[0]; i++){
-                        test_labels_int.push(this.argmax(window.test_labels.arraySync()[i]))
-                    }
-                    
-                    // get avg score per class on test:
-                    let avgscore = Array(this.state.category_names.length).fill(0)
-                    let n_samples = Array(this.state.category_names.length).fill(0)
-                    
-                    tf.tidy(() => {
-                        let predictions = window.classifier.predict(test_input).arraySync()
-
-                        for(let i = 0; i < predictions.length; i++){
-                            avgscore[test_labels_int[i]] += predictions[i][test_labels_int[i]]
-                            n_samples[test_labels_int[i]] += 1}
-
-                        })
-                    for(let i = 0; i < avgscore.length; i++){
-                        if(n_samples[i] > 0) avgscore[i] = avgscore[i]/n_samples[i]
-                    }
-
-                    this.setState({accuracy: avgscore, is_training: false})
-
-                });
-                
-            });
+            }
+        }catch(error){
+            console.error("Error durante el entrenamiento:", error)
+        }finally{
+            train_x.dispose()
+            train_y.dispose()
+            this.training = false
+            this.flushDisposals()
+            this.setState({is_training: false})
+            if(this.train_pending)
+                this.trainClassifier()
         }
     }
-    
-    
-    addPic(category){
 
-        if(this.state.output_on === -1 && !this.state.is_adding_pic){
-            this.setState({is_adding_pic: true})
-
-            let images = this.state.images
-            let n_samples = this.state.n_samples
-            n_samples[category] += 1
-            
-            const image = new Image();
-            image.src = window.webcam.getScreenshot();
-            
-            image.onload = () => {
-                const canvas = document.createElement('canvas');
-                canvas.width = this.state.img_size;
-                canvas.height = this.state.img_size;
-                const context = canvas.getContext('2d');
-                context.translate(this.state.img_size, 0);
-                context.scale(-1, 1);
-                context.drawImage(image, 0, 0, canvas.width, canvas.height);
-                const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-
-                images[category].push(canvas.toDataURL('image/png'));
-
-                var tensor = tf.browser.fromPixels(imageData).expandDims(0);
-                let feature = window.mobilenet.infer(tensor, true)
-
-                
-                let label = Array(this.state.category_names.length).fill(0)
-                label[category] = 1
-                label = tf.tensor(label).expandDims(0)
-
-                if(n_samples[category] <= TEST_SAMPLES){
-                    window.test_tensors = tf.concat([window.test_tensors, tensor])
-                    window.test_features = tf.concat([window.test_features, feature])
-                    window.test_labels = tf.concat([window.test_labels, label])}
-                else{
-                    window.train_tensors = tf.concat([window.train_tensors, tensor])
-                    window.train_features = tf.concat([window.train_features, feature])
-                    window.train_labels = tf.concat([window.train_labels, label])}
-
-                this.setState({n_samples,  output_on: category, images, is_adding_pic: false})
-
-              };        
-              
-           
-           
+    // rasgos de MobileNet que falten, de a feature_chunk fotos
+    ensureFeatures(){
+        for(const set of ['train', 'test']){
+            const tensors = window[set + '_tensors']
+            while(window[set + '_features'].shape[0] < tensors.shape[0]){
+                const old = window[set + '_features']
+                const start = old.shape[0]
+                const n = Math.min(feature_chunk, tensors.shape[0] - start)
+                window[set + '_features'] = tf.tidy(() => {
+                    const chunk = tensors.slice([start, 0, 0, 0], [n, -1, -1, -1])
+                    return tf.concat([old, window.mobilenet.infer(chunk, true)])
+                })
+                this.disposeLater(old)
             }
+        }
+    }
+
+    // puntaje promedio por clase sobre las imágenes de prueba
+    evaluate(model, net_size){
+        const nclasses = this.state.category_names.length
+        const avgscore = Array(nclasses).fill(0)
+        const counts = Array(nclasses).fill(0)
+        const test_input = net_size < 2 ? window.test_tensors : window.test_features
+        if(test_input.shape[0] === 0)
+            return avgscore
+
+        tf.tidy(() => {
+            const labels = window.test_labels.arraySync()
+            const predictions = model.predict(test_input).arraySync()
+            for(let i = 0; i < predictions.length; i++){
+                const c = this.argmax(labels[i])
+                avgscore[c] += predictions[i][c]
+                counts[c] += 1
+            }
+        })
+        return avgscore.map((score, i) => counts[i] > 0 ? score / counts[i] : 0)
+    }
+
+    addPic(category){
+        // cooldown corto: antes se esperaba toda la animación de la neurona y en una ráfaga se perdían fotos
+        const now = Date.now()
+        if(now - this.last_pic < capture_cooldown)
+            return
+        const frame = this.captureFrame()
+        if(!frame)
+            return
+        this.last_pic = now
+
+        let images = this.state.images
+        let n_samples = this.state.n_samples
+        n_samples[category] += 1
+        images[category].push(frame.canvas.toDataURL('image/png'))
+
+        // las primeras TEST_SAMPLES fotos van al conjunto de prueba
+        const set = n_samples[category] <= TEST_SAMPLES ? 'test' : 'train'
+        const old = [window[set + '_tensors'], window[set + '_labels']]
+        const [tensors, labels] = tf.tidy(() => {
+            const pixels = tf.browser.fromPixels(frame.imageData).expandDims(0).toFloat()
+            const label = tf.oneHot(category, this.state.category_names.length).toFloat().expandDims(0)
+            return [tf.concat([old[0], pixels]), tf.concat([old[1], label])]
+        })
+        old.forEach(t => this.disposeLater(t))
+        window[set + '_tensors'] = tensors
+        window[set + '_labels'] = labels
+
+        // output_on: -1 y después la categoría, para que la animación se reinicie en fotos seguidas
+        this.setState({n_samples, images, output_on: -1}, () => this.setState({output_on: category}))
+        clearTimeout(this.output_timer)
+        this.output_timer = setTimeout(this.handleTransitionEnd, 1500)
+        this.scheduleTraining()
+    }
+
+    handleLowPerfChange(enabled){
+        localStorage.setItem('kindernet_low_perf', enabled)
+        this.setState({low_perf: enabled}, () => enabled ? this.cancelScheduledTraining() : this.scheduleTraining())
+    }
+
+    handleTrainNow(){
+        this.cancelScheduledTraining()
+        this.trainClassifier()
     }
 
     captureGlobalEvent(e) {
         if(this.state.listen_keys){
             // entrenamiento
-            if (e.key <= this.state.category_names.length) {
-                const category = Number(e.key)-1
-                this.addPic(category)
-                this.trainClassifier()
-            }
-            if (e.key === "c") 
+            if (/^[1-9]$/.test(e.key) && Number(e.key) <= this.state.category_names.length)
+                this.addPic(Number(e.key) - 1)
+            if (e.key === "c")
                 this.setState({classifying: !this.state.classifying})
-        }        
-        
-
+        }
     }
 
     captureCategoryNames(i, name){
@@ -763,13 +831,14 @@ class KinderNet extends React.Component{
             facingMode: "user"
         };
 
-        let pred_message
-        if(!this.state.classifying)
-            pred_message = ""
-        else
-            if(this.state.category!==-1)
+        let pred_message = ""
+        if(this.state.classifying){
+            if(this.state.category !== -1)
                 pred_message = "¡Es '" + this.state.category_names[this.state.category] + "'!"
-           
+        }
+        else if(this.state.is_training)
+            pred_message = "La red está aprendiendo..."
+
         let ypos = []
         for (let i = 0; i <this.state.n_samples.length; i++) 
             ypos[i] = height / 2 + unit_sep[2] * (i - this.state.n_samples.length / 2)
@@ -840,6 +909,10 @@ class KinderNet extends React.Component{
                             <br/> <br/>
 
                             Podés sumar más cosas haciendo click en el botón <AddIcon/> a la derecha. También podés borrar una cosas haciendo click en el botón <DeleteIcon/>. Refrescando la página (F5) se borra todo y se vuelve a empezar. 
+
+                            <br/> <br/>
+
+                            Si la computadora es lenta, activá "Modo bajo rendimiento" en el panel de control: las fotos se guardan sin entrenar y la red aprende una sola vez cuando tocás el botón Entrenar.
 
                             
 
@@ -954,7 +1027,20 @@ class KinderNet extends React.Component{
                                     <FormControlLabel value="Grande" control={<Radio onChange={()=>{this.handleClassifierChange(2)}}/>} 
                                     label="Grande" />
                                 </RadioGroup>
-                            </Grid> 
+                            </Grid>
+                            <Grid container justifyContent='center' alignItems='center'>
+                                <FormControlLabel labelPlacement="start" sx={{mx: 0}} label="Modo bajo rendimiento"
+                                    control={<Switch checked={this.state.low_perf} onChange={(e)=>{this.handleLowPerfChange(e.target.checked)}}/>} />
+                            </Grid>
+                            {this.state.low_perf &&
+                                <Box px={1.5} pb={1.5}>
+                                    <Typography variant="caption" display="block" color="text.secondary">Las fotos se guardan sin entrenar. Cuando termines, tocá Entrenar.</Typography>
+                                    <Button fullWidth variant="contained" sx={{mt: 1}} onClick={this.handleTrainNow} disabled={!this.enoughSamples() || this.state.is_training}>
+                                        {this.state.is_training ? "Aprendiendo..." : "Entrenar"}
+                                    </Button>
+                                    {!this.enoughSamples() &&
+                                        <Typography variant="caption" display="block" color="text.secondary" sx={{mt: 0.5}}>Cada cosa necesita al menos {MIN_SAMPLES} fotos</Typography>}
+                                </Box>} 
                         </Card>
                         
                     </Grid>
@@ -965,7 +1051,12 @@ class KinderNet extends React.Component{
                             size = {this.state.net_size} n_outputs = {this.state.category_names.length}
                             classifying = {this.state.classifying} />        
                          
-                        <h1>{pred_message}</h1>   
+                        <h1>{pred_message}</h1>
+                        {this.state.gpu_error &&
+                            <Typography color="error" px={2}>
+                                El navegador dejó de responder en la placa de video, así que la red no puede aprender.
+                                Recargá la página (F5) y, si vuelve a pasar, activá "Modo bajo rendimiento".
+                            </Typography>}
             
                     </Grid>
 
