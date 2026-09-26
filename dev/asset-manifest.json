@@ -1,0 +1,17 @@
+{
+  "files": {
+    "main.css": "./static/css/main.c8fb7f3e.css",
+    "main.js": "./static/js/main.a8ddf585.js",
+    "static/js/453.84058622.chunk.js": "./static/js/453.84058622.chunk.js",
+    "static/media/sinc-logo.png": "./static/media/sinc-logo.ad1927987c31cb24e787.png",
+    "static/media/ia.png": "./static/media/ia.9fd4bb2f15077728883b.png",
+    "index.html": "./index.html",
+    "main.c8fb7f3e.css.map": "./static/css/main.c8fb7f3e.css.map",
+    "main.a8ddf585.js.map": "./static/js/main.a8ddf585.js.map",
+    "453.84058622.chunk.js.map": "./static/js/453.84058622.chunk.js.map"
+  },
+  "entrypoints": [
+    "static/css/main.c8fb7f3e.css",
+    "static/js/main.a8ddf585.js"
+  ]
+}
