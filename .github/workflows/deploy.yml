@@ -3,9 +3,16 @@ on:
   push:
     branches:
       - main
+      - dev
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+# main and dev both push to gh-pages; run deploys one at a time
+concurrency:
+  group: gh-pages-deploy
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -21,9 +28,21 @@ jobs:
         run: npm install
       - name: Build
         run: npm run build
-      - name: Deploy
+      # Stable: main -> gh-pages root (keeps the dev/ folder)
+      - name: Deploy stable
+        if: github.ref == 'refs/heads/main'
         uses: JamesIves/github-pages-deploy-action@v4
         with:
           branch: gh-pages
           folder: build
-          token: ${{ secrets.GITHUB_TOKEN }} 
+          clean-exclude: dev
+          token: ${{ secrets.GITHUB_TOKEN }}
+      # Dev: dev -> gh-pages/dev/
+      - name: Deploy dev
+        if: github.ref == 'refs/heads/dev'
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: gh-pages
+          folder: build
+          target-folder: dev
+          token: ${{ secrets.GITHUB_TOKEN }}

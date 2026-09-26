@@ -4,7 +4,7 @@ KinderNet es una aplicación web para enseñar y aprender sobre redes neuronales
 
 La aplicación corre completamente en el navegador, es decir que no hay transferencia de datos a internet (tanto las imágenes como los modelos entrenados quedan en la PC localmente y se borran al cerrar o reiniciar la aplicación) 
 
-La aplicación está funcionando en [este link](https://lbugnon.github.io/kindernet-page/).
+La aplicación está funcionando en [este link](https://sinc-lab.github.io/kindernet/). La versión de desarrollo (para pruebas) está en [este otro link](https://sinc-lab.github.io/kindernet/dev/).
 
 ## Para instalar localmente
 

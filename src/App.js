@@ -805,7 +805,7 @@ class KinderNet extends React.Component{
                             Los alumnos puedan jugar y experimentar con el proceso de entrenamiento y prueba de redes neuronales, cambiando el tamaño de la red, 
                             cantidad y tipos de clases. La red es sencilla pero puede aprender a discriminar cosas con muy pocos ejemplos.
                             <br/> <br/>
-                            Más detalles en el <Link href="https://github.com/lbugnon/kindernet-page">repositorio del proyecto</Link>.
+                            Más detalles en el <Link href="https://github.com/sinc-lab/kindernet">repositorio del proyecto</Link>.
                         </Typography>
                             
                     </DialogContent>
